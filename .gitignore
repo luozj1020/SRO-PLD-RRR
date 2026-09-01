@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.qwen/
+.claude/
+.codex/
+.agents/
+.codegraph/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+generated/
+*.bak
+*.zip
+
+# Manuscript and SI (not for GitHub)
+npj_ComputMater_Manuscript.md
+npj_ComputMater_Manuscript_cn.md
+npj_ComputMater_Manuscript.docx
+npj_ComputMater_Manuscript.pdf
+npj_ComputMater_Manuscript_cn.docx
+npj_ComputMater_Manuscript_cn.pdf
+npj_SI.md
+npj_SI_cn.md
+npj_SI.docx
+npj_SI.pdf
+npj_ComputMater_Manuscript.assets/
+revision/
+revisions/
+paper_figures/
+Language_model_priors*.docx
+Language_model_priors*.pdf
+Language_model_priors*.md
+*.docx
+*.pdf
+
+# Large generated files
+*.xlsx
+!data/converted_file.xlsx
+*.joblib
+*.pth
+*.xgb
+*.pkl
+*.npy
+*.npz
+*.png
+model_comprehensive_scores_*.csv
+top_solutions_by_category_*.xlsx
+**/pareto_solution/
