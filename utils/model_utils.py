@@ -1,3 +1,5 @@
+import ast
+
 import torch
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, RobustScaler
@@ -6,11 +8,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import random
 import warnings
-from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.impute import SimpleImputer, KNNImputer
 from typing import Dict, List, Optional, Union
 from pathlib import Path
 import logging
+from torch.utils.data import Dataset
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,6 +36,179 @@ def setup_seed(seed: int = 42):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def uncertainty_based_filtering(
+        X, y, model,
+        uncertainty_threshold_percentile=85,
+        min_samples_to_keep=200
+):
+    """Remove the most uncertain predictions while retaining enough samples."""
+    if not model.bnn_model or not model.is_fitted:
+        logger.warning(
+            "Model or BNN not fitted, cannot perform uncertainty filtering. "
+            "Returning original data."
+        )
+        return X, y
+
+    prediction_input = (
+        pd.DataFrame(X, columns=model.base_features)
+        if isinstance(X, np.ndarray)
+        else X
+    )
+    _, uncertainties = model.predict(prediction_input)
+    threshold = np.percentile(uncertainties, uncertainty_threshold_percentile)
+
+    keep_mask = uncertainties < threshold
+    if np.sum(keep_mask) < min_samples_to_keep:
+        indices_to_keep = np.argsort(uncertainties)[:min_samples_to_keep]
+        keep_mask = np.zeros(len(uncertainties), dtype=bool)
+        keep_mask[indices_to_keep] = True
+
+    if isinstance(X, pd.DataFrame):
+        filtered_X = X.iloc[keep_mask]
+        filtered_y = y.iloc[keep_mask] if isinstance(y, pd.Series) else y[keep_mask]
+    else:
+        filtered_X = X[keep_mask]
+        filtered_y = y[keep_mask]
+
+    return filtered_X, filtered_y
+
+
+class enable_dropout:
+    """Temporarily enable dropout while preserving the model training state."""
+
+    def __init__(self, model):
+        self.model = model
+        self.original_training = model.training
+
+    def __enter__(self):
+        self.model.train()
+        for module in self.model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.train()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.model.train(self.original_training)
+
+
+SEQUENCE_FEATURE_COLUMNS = (
+    'Temperature',
+    'Laser energy density',
+    'Oxygen pressure',
+    'Frequency',
+    'Thickness',
+)
+
+
+class OrdinalDataset(Dataset):
+    """Load favourable and unfavourable ordinal condition sequences."""
+
+    def __init__(self, processor, good_data_path, bad_data_path, base_features):
+        self.processor = processor
+        self.base_features = base_features
+        try:
+            self.good_data = pd.read_csv(good_data_path)
+            self.bad_data = pd.read_csv(bad_data_path)
+            self.good_sequences = self._preprocess_data(self.good_data)
+            self.bad_sequences = self._preprocess_data(self.bad_data)
+        except Exception as exc:
+            logger.error("Sequence data loading failed: %s", exc)
+            self.good_sequences = []
+            self.bad_sequences = []
+
+    def _preprocess_data(self, data):
+        sequences = []
+        for idx in range(len(data)):
+            sequence = []
+            for column in (f'condition_{i}' for i in range(1, 6)):
+                try:
+                    if column in data.columns and not pd.isna(data[column].iloc[idx]):
+                        condition_values = np.array(
+                            ast.literal_eval(data[column].iloc[idx]), dtype=np.float32
+                        )
+                        if len(condition_values) != len(SEQUENCE_FEATURE_COLUMNS):
+                            raise ValueError(
+                                f"Expected {len(SEQUENCE_FEATURE_COLUMNS)} sequence features, "
+                                f"got {len(condition_values)}"
+                            )
+                        condition_df = pd.DataFrame(
+                            [condition_values], columns=SEQUENCE_FEATURE_COLUMNS
+                        )[self.base_features]
+                        sequence.append(self.processor.transform(condition_df)[0])
+                    else:
+                        sequence.append(
+                            np.zeros(len(self.base_features), dtype=np.float32)
+                        )
+                except Exception as exc:
+                    logger.warning("Error processing condition: %s", exc)
+                    sequence.append(np.zeros(len(self.base_features), dtype=np.float32))
+            sequences.append(np.stack(sequence))
+        return sequences
+
+    def __len__(self):
+        return len(self.good_sequences) + len(self.bad_sequences)
+
+    def __getitem__(self, idx):
+        if idx < len(self.good_sequences):
+            return torch.FloatTensor(self.good_sequences[idx]), 0
+        return torch.FloatTensor(
+            self.bad_sequences[idx - len(self.good_sequences)]
+        ), 1
+
+
+def sequence_ranking_loss(bnn_model, residual_stats, sequences, labels, config):
+    """Calculate the differentiable ordinal contrast loss."""
+    batch_size, seq_len, feature_dim = sequences.shape
+    flat_sequences = sequences.reshape(-1, feature_dim)
+
+    device = next(bnn_model.parameters()).device
+    flat_sequences_device = flat_sequences.to(device)
+    sequence_mask = torch.ones_like(flat_sequences_device, device=device)
+
+    bnn_residuals = bnn_model(flat_sequences_device, sequence_mask).reshape(
+        batch_size, seq_len
+    )
+    residual_std = torch.as_tensor(
+        residual_stats['std'], dtype=bnn_residuals.dtype, device=device
+    )
+    residual_mean = torch.as_tensor(
+        residual_stats['mean'], dtype=bnn_residuals.dtype, device=device
+    )
+    final_preds = bnn_residuals * residual_std + residual_mean
+
+    intra_good_loss = torch.tensor(0.0, device=sequences.device)
+    intra_bad_loss = torch.tensor(0.0, device=sequences.device)
+    inter_loss = torch.tensor(0.0, device=sequences.device)
+
+    good_seqs = final_preds[labels == 0]
+    bad_seqs = final_preds[labels == 1]
+
+    if good_seqs.numel() > 0 and good_seqs.shape[1] > 1:
+        good_diffs = good_seqs[:, 1:] - good_seqs[:, :-1]
+        intra_good_loss = (
+            torch.sum(torch.relu(good_diffs))
+            * config.sequence_loss['intra_good_penalty']
+        )
+
+    if bad_seqs.numel() > 0 and bad_seqs.shape[1] > 1:
+        bad_diffs = bad_seqs[:, :-1] - bad_seqs[:, 1:]
+        intra_bad_loss = (
+            torch.sum(torch.relu(bad_diffs))
+            * config.sequence_loss['intra_bad_penalty']
+        )
+
+    if good_seqs.numel() > 0 and bad_seqs.numel() > 0:
+        min_good = good_seqs.min(dim=1).values
+        max_bad = bad_seqs.max(dim=1).values
+        inter_diff = max_bad.unsqueeze(1) - min_good.unsqueeze(0)
+        inter_loss = (
+            torch.sum(torch.relu(inter_diff))
+            * config.sequence_loss['inter_penalty']
+        )
+
+    total_loss = intra_good_loss + intra_bad_loss + inter_loss
+    return total_loss, intra_good_loss, intra_bad_loss, inter_loss
 
 
 def plot_sequence_loss(history: Dict, save_path: Optional[str] = None):

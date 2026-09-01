@@ -40,6 +40,8 @@ if __name__ == "__main__":
     BASE_FEATURES = ['Oxygen pressure', 'Laser energy density', 'Temperature', 'Frequency', 'Thickness']
     TARGET_COLUMN = 'rrr'
     STO_COLUMN = 'Substrate'
+    SEQUENCE_GOOD_PATH = './data/extracted_conditions_good.csv' if args.mode == 'LLM' else ''
+    SEQUENCE_BAD_PATH = './data/extracted_conditions_bad.csv' if args.mode == 'LLM' else ''
 
     # Weight configuration for samples
     WEIGHT_CONFIG = {
@@ -67,7 +69,7 @@ if __name__ == "__main__":
     tuning_config.primary_metric = 'r2'
     tuning_config.direction = 'maximize'
     tuning_config.parallel_backend = 'thread'
-    tuning_config.multi_objective_type = 'cv'  # 或 'loss'
+    tuning_config.multi_objective_type = 'loss' if args.mode == 'LLM' else 'cv'
     tuning_config.timeout = None  # 可设置超时时间(秒)
 
     # 修改输出目录，根据命令行参数动态生成
@@ -109,6 +111,8 @@ if __name__ == "__main__":
             config_class=ModelConfig,
             use_boundary_weights=True,
             boundary_config=BOUNDARY_CONFIG,
+            sequence_good_path=SEQUENCE_GOOD_PATH,
+            sequence_bad_path=SEQUENCE_BAD_PATH,
             verbose=True,
             show_progress=True,
         )

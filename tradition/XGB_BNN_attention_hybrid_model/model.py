@@ -24,7 +24,13 @@ current_script_path = os.path.abspath(__file__)
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_script_path))))
 sys.path.insert(0, root_dir)
 # 导入辅助模块
-from utils.model_utils import ModelVisualizer, create_experiment_report, setup_seed
+from utils.model_utils import (
+    ModelVisualizer,
+    create_experiment_report,
+    enable_dropout,
+    setup_seed,
+    uncertainty_based_filtering,
+)
 from utils.data_processer import (
     ClusteringBasedWeightCalculator,
     EnhancedFeatureProcessor,
@@ -46,55 +52,6 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # 设备配置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def uncertainty_based_filtering(
-        X, y, model,
-        uncertainty_threshold_percentile=85,
-        min_samples_to_keep=200
-):
-    """
-    Remove only the most uncertain predictions based on BNN uncertainty estimates.
-
-    Args:
-        X (np.ndarray or torch.Tensor): Input features.
-        y (np.ndarray or torch.Tensor): Target values.
-        model (HybridModel): The fitted model containing the BNN.
-        uncertainty_threshold_percentile (float): Percentile to set the uncertainty threshold (e.g., 85).
-        min_samples_to_keep (int): Minimum number of samples to keep after filtering.
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray]: Filtered X and y arrays.
-    """
-    if not model.bnn_model or not model.is_fitted:
-        logger.warning("Model or BNN not fitted, cannot perform uncertainty filtering. Returning original data.")
-        return X, y
-
-    # Use the model's predict method to get uncertainties
-    _, uncertainties = model.predict(pd.DataFrame(X, columns=model.base_features) if isinstance(X, np.ndarray) else X)
-    threshold = np.percentile(uncertainties, uncertainty_threshold_percentile)
-
-    keep_mask = uncertainties < threshold
-    num_kept = np.sum(keep_mask)
-
-    # Ensure minimum sample size
-    if num_kept < min_samples_to_keep:
-        # logger.info(f"Number of samples after uncertainty filtering ({num_kept}) is below min_samples_to_keep ({min_samples_to_keep}). Adjusting.")
-        # Keep the indices of the min_samples_to_keep samples with the lowest uncertainty
-        indices_to_keep = np.argsort(uncertainties)[:min_samples_to_keep]
-        keep_mask = np.zeros(len(uncertainties), dtype=bool)
-        keep_mask[indices_to_keep] = True
-
-    # logger.info(f"Uncertainty filtering: Kept {np.sum(keep_mask)}/{len(keep_mask)} samples.")
-
-    if isinstance(X, pd.DataFrame):
-        filtered_X = X.iloc[keep_mask]
-        filtered_y = y.iloc[keep_mask] if isinstance(y, pd.Series) else y[keep_mask]
-    else:  # Assume numpy arrays
-        filtered_X = X[keep_mask]
-        filtered_y = y[keep_mask]
-
-    return filtered_X, filtered_y
 
 
 @dataclass
@@ -247,23 +204,6 @@ class ModelConfig:
         'fine_tune_uncertainty_pruning_min_samples': 100,
         'fine_tune_uncertainty_pruning_frequency': 25,
     })
-
-
-class enable_dropout:
-    """临时启用dropout的上下文管理器"""
-
-    def __init__(self, model):
-        self.model = model
-        self.original_training = model.training
-
-    def __enter__(self):
-        self.model.train()
-        for module in self.model.modules():
-            if isinstance(module, nn.Dropout):
-                module.train()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.model.train(self.original_training)
 
 
 class SelfAttention(nn.Module):

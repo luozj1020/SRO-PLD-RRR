@@ -1,7 +1,6 @@
 import logging
 import os
 import sys
-import ast
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +16,7 @@ import torch.optim as optim
 import xgboost as xgb
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, TensorDataset, Subset, Dataset
+from torch.utils.data import DataLoader, TensorDataset, Subset
 from tqdm import tqdm
 
 # 添加项目根目录到系统路径
@@ -25,7 +24,15 @@ current_script_path = os.path.abspath(__file__)
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_script_path))))
 sys.path.insert(0, root_dir)
 # 导入辅助模块
-from utils.model_utils import ModelVisualizer, create_experiment_report, setup_seed
+from utils.model_utils import (
+    ModelVisualizer,
+    OrdinalDataset,
+    create_experiment_report,
+    enable_dropout,
+    sequence_ranking_loss,
+    setup_seed,
+    uncertainty_based_filtering,
+)
 from utils.data_processer import (
     ClusteringBasedWeightCalculator,
     EnhancedFeatureProcessor,
@@ -47,55 +54,6 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # 设备配置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def uncertainty_based_filtering(
-        X, y, model,
-        uncertainty_threshold_percentile=85,
-        min_samples_to_keep=200
-):
-    """
-    Remove only the most uncertain predictions based on BNN uncertainty estimates.
-
-    Args:
-        X (np.ndarray or torch.Tensor): Input features.
-        y (np.ndarray or torch.Tensor): Target values.
-        model (HybridModel): The fitted model containing the BNN.
-        uncertainty_threshold_percentile (float): Percentile to set the uncertainty threshold (e.g., 85).
-        min_samples_to_keep (int): Minimum number of samples to keep after filtering.
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray]: Filtered X and y arrays.
-    """
-    if not model.bnn_model or not model.is_fitted:
-        logger.warning("Model or BNN not fitted, cannot perform uncertainty filtering. Returning original data.")
-        return X, y
-
-    # Use the model's predict method to get uncertainties
-    _, uncertainties = model.predict(pd.DataFrame(X, columns=model.base_features) if isinstance(X, np.ndarray) else X)
-    threshold = np.percentile(uncertainties, uncertainty_threshold_percentile)
-
-    keep_mask = uncertainties < threshold
-    num_kept = np.sum(keep_mask)
-
-    # Ensure minimum sample size
-    if num_kept < min_samples_to_keep:
-        # logger.info(f"Number of samples after uncertainty filtering ({num_kept}) is below min_samples_to_keep ({min_samples_to_keep}). Adjusting.")
-        # Keep the indices of the min_samples_to_keep samples with the lowest uncertainty
-        indices_to_keep = np.argsort(uncertainties)[:min_samples_to_keep]
-        keep_mask = np.zeros(len(uncertainties), dtype=bool)
-        keep_mask[indices_to_keep] = True
-
-    # logger.info(f"Uncertainty filtering: Kept {np.sum(keep_mask)}/{len(keep_mask)} samples.")
-
-    if isinstance(X, pd.DataFrame):
-        filtered_X = X.iloc[keep_mask]
-        filtered_y = y.iloc[keep_mask] if isinstance(y, pd.Series) else y[keep_mask]
-    else:  # Assume numpy arrays
-        filtered_X = X[keep_mask]
-        filtered_y = y[keep_mask]
-
-    return filtered_X, filtered_y
 
 
 @dataclass
@@ -259,23 +217,6 @@ class ModelConfig:
     @property
     def sequence_loss_enabled(self):
         return self.sequence_loss.get('enabled', False)
-
-
-class enable_dropout:
-    """临时启用dropout的上下文管理器"""
-
-    def __init__(self, model):
-        self.model = model
-        self.original_training = model.training
-
-    def __enter__(self):
-        self.model.train()
-        for module in self.model.modules():
-            if isinstance(module, nn.Dropout):
-                module.train()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.model.train(self.original_training)
 
 
 class BNN(nn.Module):
@@ -480,101 +421,6 @@ class BNN(nn.Module):
             predictions = np.concatenate(all_predictions, axis=1)
 
         return predictions
-
-
-class OrdinalDataset(Dataset):
-    """Sequence contrast dataset"""
-
-    def __init__(self, processor, good_data_path, bad_data_path, base_features):  # 添加base_features参数
-        self.processor = processor
-        self.base_features = base_features  # 存储base_features
-        try:
-            self.good_data = pd.read_csv(good_data_path)
-            self.bad_data = pd.read_csv(bad_data_path)
-            self.good_sequences = self._preprocess_data(self.good_data)
-            self.bad_sequences = self._preprocess_data(self.bad_data)
-        except Exception as e:
-            logger.error(f"Sequence data loading failed: {str(e)}")
-            self.good_sequences = []
-            self.bad_sequences = []
-
-    def _preprocess_data(self, data):
-        sequences = []
-        feature_columns = self.base_features  # 使用存储的base_features
-        for idx in range(len(data)):
-            sequence = []
-            for col in [f'condition_{i}' for i in range(1, 6)]:
-                try:
-                    if col in data.columns and not pd.isna(data[col].iloc[idx]):
-                        # Parse the condition values
-                        condition_values = np.array(ast.literal_eval(data[col].iloc[idx]), dtype=np.float32)
-                        # Create a DataFrame row for processing
-                        condition_df = pd.DataFrame([condition_values], columns=feature_columns)
-                        # Process using the pre-trained processor
-                        processed_condition = self.processor.transform(condition_df)[0]
-                        sequence.append(processed_condition)
-                    else:
-                        # Use zeros if condition is missing
-                        sequence.append(np.zeros(len(feature_columns), dtype=np.float32))
-                except Exception as e:
-                    logger.warning(f"Error processing condition: {str(e)}")
-                    sequence.append(np.zeros(len(feature_columns), dtype=np.float32))
-            sequences.append(np.stack(sequence))
-        return sequences
-
-    def __len__(self):
-        return len(self.good_sequences) + len(self.bad_sequences)
-
-    def __getitem__(self, idx):
-        if idx < len(self.good_sequences):
-            return torch.FloatTensor(self.good_sequences[idx]), 0
-        else:
-            return torch.FloatTensor(self.bad_sequences[idx - len(self.good_sequences)]), 1
-
-
-def sequence_ranking_loss(bnn_model, residual_stats, sequences, labels, config):
-    """Sequence contrast loss calculation"""
-    batch_size, seq_len, feature_dim = sequences.shape
-    flat_sequences = sequences.reshape(-1, feature_dim)
-
-    device = next(bnn_model.parameters()).device
-    flat_sequences_device = flat_sequences.to(device)
-    sequence_mask = torch.ones_like(flat_sequences_device, device=device)
-
-    bnn_residuals = bnn_model(flat_sequences_device, sequence_mask).reshape(batch_size, seq_len)
-    residual_std = torch.as_tensor(residual_stats['std'], dtype=bnn_residuals.dtype, device=device)
-    residual_mean = torch.as_tensor(residual_stats['mean'], dtype=bnn_residuals.dtype, device=device)
-    final_preds = bnn_residuals * residual_std + residual_mean
-
-    # Calculate losses
-    intra_good_loss = torch.tensor(0.0, device=sequences.device)
-    intra_bad_loss = torch.tensor(0.0, device=sequences.device)
-    inter_loss = torch.tensor(0.0, device=sequences.device)
-
-    good_mask = labels == 0
-    bad_mask = labels == 1
-    good_seqs = final_preds[good_mask]
-    bad_seqs = final_preds[bad_mask]
-
-    # Intra-good sequence loss
-    if good_seqs.numel() > 0 and good_seqs.shape[1] > 1:
-        good_diffs = good_seqs[:, :-1] - good_seqs[:, 1:]
-        intra_good_loss = torch.sum(torch.relu(good_diffs)) * config.sequence_loss['intra_good_penalty']
-
-    # Intra-bad sequence loss
-    if bad_seqs.numel() > 0 and bad_seqs.shape[1] > 1:
-        bad_diffs = bad_seqs[:, 1:] - bad_seqs[:, :-1]
-        intra_bad_loss = torch.sum(torch.relu(bad_diffs)) * config.sequence_loss['intra_bad_penalty']
-
-    # Inter-sequence loss
-    if good_seqs.numel() > 0 and bad_seqs.numel() > 0:
-        min_bad = bad_seqs.min(dim=1).values
-        max_good = good_seqs.max(dim=1).values
-        inter_diff = min_bad.unsqueeze(1) - max_good.unsqueeze(0)
-        inter_loss = torch.sum(torch.relu(inter_diff)) * config.sequence_loss['inter_penalty']
-
-    total_loss = intra_good_loss + intra_bad_loss + inter_loss
-    return total_loss, intra_good_loss, intra_bad_loss, inter_loss
 
 
 class HybridModel:
@@ -1288,7 +1134,10 @@ class HybridModel:
 
         # Sequence data loader
         sequence_dataloader = None
-        sequence_loss_enabled = self.config.sequence_loss.get('enabled', False)
+        # The ordinal prior is applied during surrogate pretraining only.
+        sequence_loss_enabled = (
+            self.config.sequence_loss.get('enabled', False) and stage == 'pretrain'
+        )
         if sequence_loss_enabled:
             try:
                 sequence_dataset = OrdinalDataset(
@@ -1313,7 +1162,9 @@ class HybridModel:
                 sequence_loss_enabled = False
 
         # 记录序列损失启用状态到history
-        self.history['sequence_loss_enabled'] = sequence_loss_enabled
+        self.history['sequence_loss_enabled'] = (
+            self.history.get('sequence_loss_enabled', False) or sequence_loss_enabled
+        )
 
         # if show_parameter_info:
         # logger.info("=" * 60)
@@ -1522,31 +1373,28 @@ class HybridModel:
                             penalty = penalty_strength * weight_change_penalty
                             if not (torch.isnan(penalty) or torch.isinf(penalty)):
                                 loss = loss + penalty
-                    if sequence_loss_enabled and sequence_iterator is not None:
-                        try:
-                            sequence_batch = next(sequence_iterator)
-                        except StopIteration:
-                            sequence_iterator = iter(sequence_dataloader)
-                            sequence_batch = next(sequence_iterator)
+                if sequence_loss_enabled and sequence_iterator is not None:
+                    try:
+                        sequence_batch = next(sequence_iterator)
+                    except StopIteration:
+                        sequence_iterator = iter(sequence_dataloader)
+                        sequence_batch = next(sequence_iterator)
 
-                        seq_inputs, seq_labels = sequence_batch
-                        seq_inputs, seq_labels = seq_inputs.to(device), seq_labels.to(device)
+                    seq_inputs, seq_labels = sequence_batch
+                    seq_inputs, seq_labels = seq_inputs.to(device), seq_labels.to(device)
 
-                        seq_loss, intra_good_l, intra_bad_l, inter_l = sequence_ranking_loss(
-                            self.bnn_model, self.residual_stats, seq_inputs, seq_labels, self.config
-                        )
+                    seq_loss, intra_good_l, intra_bad_l, inter_l = sequence_ranking_loss(
+                        self.bnn_model, self.residual_stats, seq_inputs, seq_labels, self.config
+                    )
 
-                        # Fixed: Use current loss instead of avg_loss (which isn't calculated yet)
-                        # Adaptive weight based on current batch loss
-                        current_loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
-                        seq_loss_weight = min(0.5, max(0.1, 10.0 / (current_loss_value + 1e-8)))
-                        loss = loss + seq_loss_weight * seq_loss
+                    current_loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
+                    seq_loss_weight = min(0.5, max(0.1, 10.0 / (current_loss_value + 1e-8)))
+                    loss = loss + seq_loss_weight * seq_loss
 
-                        # Accumulate sequence losses for logging
-                        sequence_loss_total += seq_loss.item()
-                        intra_good_loss_total += intra_good_l.item()
-                        intra_bad_loss_total += intra_bad_l.item()
-                        inter_loss_total += inter_l.item()
+                    sequence_loss_total += seq_loss.item()
+                    intra_good_loss_total += intra_good_l.item()
+                    intra_bad_loss_total += intra_bad_l.item()
+                    inter_loss_total += inter_l.item()
 
                 loss = loss / accumulation_steps
                 loss.backward()
@@ -1649,13 +1497,17 @@ class HybridModel:
                     scheduler_main.step(avg_loss)
 
             self.history['loss'].append(avg_loss)
+            if stage == 'pretrain':
+                self.pretrain_final_loss = avg_loss
             self.history['r2'].append(train_r2)
             self.history['learning_rates'].append(optimizer.param_groups[0]['lr'])
             self.history['sequence_loss'].append(avg_sequence_loss)
             self.history['intra_good_loss'].append(avg_intra_good_loss)
             self.history['intra_bad_loss'].append(avg_intra_bad_loss)
             self.history['inter_loss'].append(avg_inter_loss)
-            self.history['sequence_loss_enabled'] = sequence_loss_enabled
+            self.history['sequence_loss_enabled'] = (
+                self.history.get('sequence_loss_enabled', False) or sequence_loss_enabled
+            )
 
             if show_progress_bar:
                 epoch_iterator.set_postfix({'loss': f'{avg_loss:.4f}', 'R2': f'{train_r2:.4f}',

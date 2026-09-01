@@ -15,7 +15,7 @@ import multiprocessing as mp
 import gc
 import torch
 
-from model_utils import ModelVisualizer, plot_sequence_loss
+from utils.model_utils import ModelVisualizer, plot_sequence_loss
 from utils.data_processer import calculate_boundary_penalty_weights, compute_fixed_covariance_matrix, BOUND_1, BOUND_2
 from utils.tuning_config import TuningConfig
 
@@ -387,7 +387,9 @@ class HyperparameterTuner:
             if self.tuning_config.multi_objective_type == 'loss':
                 # 使用最终损失
                 final_loss = float('inf')
-                if hasattr(model, 'history') and model.history is not None:
+                if hasattr(model, 'pretrain_final_loss'):
+                    final_loss = model.pretrain_final_loss
+                elif hasattr(model, 'history') and model.history is not None:
                     loss_history = model.history.get('loss', [])
                     if loss_history and len(loss_history) > 0:
                         final_loss = loss_history[-1]
